@@ -1,0 +1,8 @@
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp" android:height="108dp"
+    android:viewportWidth="108" android:viewportHeight="108">
+    <!-- Folded document / calendar mark, kept inside the adaptive-icon safe zone. -->
+    <path android:fillColor="#FFFFFF" android:pathData="M32,26h30l14,14v42h-44z"/>
+    <path android:fillColor="#B8C4FF" android:pathData="M62,26l14,14h-14z"/>
+    <path android:fillColor="#315EFB" android:pathData="M40,52h28v6h-28zM40,64h28v6h-28zM40,76h18v6h-18z"/>
+</vector>
