@@ -11,7 +11,9 @@ fun expiryStatus(expiry: Long?, warningDays: Int = 30, now: Long = System.curren
     if (expiry == null) return ExpiryStatus.NO_EXPIRY
     val today = startOfDay(now)
     if (expiry < today) return ExpiryStatus.EXPIRED
-    return if (expiry <= today + warningDays * 86_400_000L) ExpiryStatus.EXPIRING_SOON else ExpiryStatus.ACTIVE
+    // warningDays <= 0 means "No reminder"; still flag documents expiring within 30 days.
+    val warn = if (warningDays <= 0) 30 else warningDays
+    return if (expiry <= today + warn * 86_400_000L) ExpiryStatus.EXPIRING_SOON else ExpiryStatus.ACTIVE
 }
 
 fun formatDate(ms: Long?): String =

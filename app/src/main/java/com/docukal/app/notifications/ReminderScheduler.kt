@@ -23,6 +23,8 @@ class ReminderScheduler(private val context: Context) {
 
     fun schedule(kind: ReminderKind, id: Long, title: String, targetDate: Long?, reminderDays: Int) {
         cancel(kind, id)
+        // reminderDays <= 0 means the user chose "No reminder".
+        if (reminderDays <= 0) return
         val target = targetDate ?: return
         val at = target - reminderDays * 86_400_000L
         if (at <= System.currentTimeMillis()) return

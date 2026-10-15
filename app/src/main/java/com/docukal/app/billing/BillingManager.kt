@@ -4,24 +4,33 @@ import android.app.Activity
 import android.content.Context
 import androidx.compose.runtime.State
 import androidx.compose.runtime.mutableStateOf
+import com.android.billingclient.api.AcknowledgePurchaseParams
 import com.android.billingclient.api.BillingClient
 import com.android.billingclient.api.BillingClientStateListener
-import com.android.billingclient.api.BillingResult
 import com.android.billingclient.api.BillingFlowParams
-import com.android.billingclient.api.ProductDetails
+import com.android.billingclient.api.BillingResult
 import com.android.billingclient.api.PendingPurchasesParams
+import com.android.billingclient.api.ProductDetails
 import com.android.billingclient.api.Purchase
 import com.android.billingclient.api.PurchasesUpdatedListener
 import com.android.billingclient.api.QueryProductDetailsParams
 import com.android.billingclient.api.QueryPurchasesParams
+import android.util.Log
+import java.lang.ref.WeakReference
 
 /**
- * Handles the Google Play one-time Premium upgrade.
+ * Handles the Google Play one-time Premium upgrade (INAPP product "docukal_premium").
  *
- * Configure the product id "docukal_premium" as an INAPP product in Play
- * Console before publishing. Premium is verified from the Play purchase list
- * each time the billing connection is established, so a stale local flag is
- * not enough to keep ads disabled.
+ * Fixes vs. the released version:
+ *  1. First tap no longer silently does nothing: if the connection / product details
+ *     are not ready yet, the tap is remembered and the purchase sheet opens as soon
+ *     as they are ready (plus a message is shown).
+ *  2. ITEM_ALREADY_OWNED (response code 7) is handled: we re-query Play and unlock
+ *     Premium instead of leaving the user stuck on the "Upgrade" button.
+ *  3. Premium is unlocked as soon as Play reports PURCHASED. Acknowledge is done
+ *     afterwards, so a failed acknowledge can no longer leave a paid user on the free plan.
+ *  4. refreshPurchases() lets the app re-sync on every resume (e.g. after the user
+ *     switched Google account in the Play Store).
  */
 class BillingManager(context: Context) {
     companion object {
@@ -30,39 +39,47 @@ class BillingManager(context: Context) {
 
     private val appContext = context.applicationContext
     private val prefs = appContext.getSharedPreferences("docukal_premium", Context.MODE_PRIVATE)
-    private val premiumMutable = mutableStateOf(
-        prefs.getBoolean("premium_unlocked", false)
-    )
+    private val premiumMutable = mutableStateOf(prefs.getBoolean("premium_unlocked", false))
     val premium: State<Boolean> = premiumMutable
+
+    private var productDetails: ProductDetails? = null
+
+    // Set when the user tapped Upgrade before billing was ready.
+    private var pendingActivity: WeakReference<Activity>? = null
+    private var pendingMessage: ((String) -> Unit)? = null
 
     private fun setPremium(value: Boolean) {
         premiumMutable.value = value
         prefs.edit().putBoolean("premium_unlocked", value).apply()
     }
 
-    private var productDetails: ProductDetails? = null
-
-    private val listener = object : BillingClientStateListener {
+    private val stateListener = object : BillingClientStateListener {
         override fun onBillingSetupFinished(result: BillingResult) {
             if (result.responseCode == BillingClient.BillingResponseCode.OK) {
-                queryPremiumProduct()
                 queryExistingPurchase()
+                queryPremiumProduct()
+            } else {
+                failPending("Google Play Billing is unavailable right now. Please try again.")
             }
         }
 
         override fun onBillingServiceDisconnected() {
-            // BillingClient will reconnect automatically when supported.
+            // enableAutoServiceReconnection() reconnects automatically.
         }
     }
 
-    private val purchasesListener = object : PurchasesUpdatedListener {
-        override fun onPurchasesUpdated(
-            result: BillingResult,
-            purchases: MutableList<Purchase>?
-        ) {
-            if (result.responseCode == BillingClient.BillingResponseCode.OK && purchases != null) {
-                purchases.forEach { handlePurchase(it) }
-            }
+    private val purchasesListener = PurchasesUpdatedListener { result, purchases ->
+        when (result.responseCode) {
+            BillingClient.BillingResponseCode.OK ->
+                purchases?.forEach { handlePurchase(it) }
+
+            // User already owns it on this Play account -> just re-sync and unlock.
+            BillingClient.BillingResponseCode.ITEM_ALREADY_OWNED ->
+                queryExistingPurchase()
+
+            BillingClient.BillingResponseCode.USER_CANCELED -> Unit
+
+            else -> pendingMessage?.invoke("Purchase failed (code ${result.responseCode}). Please try again.")
         }
     }
 
@@ -73,40 +90,71 @@ class BillingManager(context: Context) {
         .build()
 
     fun startConnection() {
-        if (!billingClient.isReady) billingClient.startConnection(listener)
+        if (!billingClient.isReady) billingClient.startConnection(stateListener)
     }
 
     fun endConnection() {
         billingClient.endConnection()
     }
 
-    fun launchPremiumPurchase(activity: Activity, onUnavailable: () -> Unit = {}) {
+    /** Call from ON_RESUME so ownership is re-checked (account switch, refund, restore). */
+    fun refreshPurchases() {
+        if (billingClient.isReady) queryExistingPurchase() else startConnection()
+    }
+
+    fun launchPremiumPurchase(activity: Activity, onMessage: (String) -> Unit = {}) {
+        pendingMessage = onMessage
+
+        if (premiumMutable.value) {
+            onMessage("Premium is already active.")
+            return
+        }
+
         if (!billingClient.isReady) {
+            pendingActivity = WeakReference(activity)
+            onMessage("Connecting to Google Play… please wait a moment.")
             startConnection()
-            onUnavailable()
             return
         }
 
-        val details = productDetails ?: run {
+        val details = productDetails
+        if (details == null) {
+            pendingActivity = WeakReference(activity)
+            onMessage("Loading Premium details… please wait a moment.")
             queryPremiumProduct()
-            onUnavailable()
             return
         }
 
-        val offerBuilder = BillingFlowParams.ProductDetailsParams.newBuilder()
+        pendingActivity = null
+        launchFlow(activity, details)
+    }
+
+    private fun launchFlow(activity: Activity, details: ProductDetails) {
+        val productParams = BillingFlowParams.ProductDetailsParams.newBuilder()
             .setProductDetails(details)
         details.oneTimePurchaseOfferDetailsList
             ?.firstOrNull()
             ?.offerToken
             ?.takeIf { it.isNotBlank() }
-            ?.let { offerBuilder.setOfferToken(it) }
+            ?.let { productParams.setOfferToken(it) }
 
-        val offer = offerBuilder.build()
         val params = BillingFlowParams.newBuilder()
-            .setProductDetailsParamsList(listOf(offer))
+            .setProductDetailsParamsList(listOf(productParams.build()))
             .build()
 
-        billingClient.launchBillingFlow(activity, params)
+        val result = billingClient.launchBillingFlow(activity, params)
+        when (result.responseCode) {
+            BillingClient.BillingResponseCode.OK -> Unit
+            BillingClient.BillingResponseCode.ITEM_ALREADY_OWNED -> queryExistingPurchase()
+            else -> pendingMessage?.invoke("Could not open Google Play (code ${result.responseCode}).")
+        }
+    }
+
+    private fun failPending(message: String) {
+        if (pendingActivity != null) {
+            pendingActivity = null
+            pendingMessage?.invoke(message)
+        }
     }
 
     private fun queryPremiumProduct() {
@@ -118,12 +166,24 @@ class BillingManager(context: Context) {
                 .build()
         )
         billingClient.queryProductDetailsAsync(
-            QueryProductDetailsParams.newBuilder()
-                .setProductList(products)
-                .build()
+            QueryProductDetailsParams.newBuilder().setProductList(products).build()
         ) { result, detailsResult ->
             if (result.responseCode == BillingClient.BillingResponseCode.OK) {
                 productDetails = detailsResult.productDetailsList.firstOrNull()
+            }
+            val reason = "code=${result.responseCode} (${result.debugMessage}), " +
+                "found=${detailsResult.productDetailsList.size}, " +
+                "unfetched=${detailsResult.unfetchedProductList.size}"
+            Log.d("BillingManager", "queryProductDetails: $reason")
+
+            // If the user already tapped Upgrade, open the purchase sheet now.
+            val activity = pendingActivity?.get()
+            val details = productDetails
+            if (activity != null && details != null && !premiumMutable.value) {
+                pendingActivity = null
+                launchFlow(activity, details)
+            } else if (pendingActivity != null && details == null) {
+                failPending("Premium product not available from Google Play. $reason")
             }
         }
     }
@@ -136,16 +196,13 @@ class BillingManager(context: Context) {
                 .build()
         ) { result, purchases ->
             if (result.responseCode == BillingClient.BillingResponseCode.OK) {
-                val premiumPurchase = purchases.firstOrNull { purchase ->
-                    purchase.products.contains(PREMIUM_PRODUCT_ID) &&
-                        purchase.purchaseState == Purchase.PurchaseState.PURCHASED
+                val owned = purchases.firstOrNull {
+                    it.products.contains(PREMIUM_PRODUCT_ID) &&
+                        it.purchaseState == Purchase.PurchaseState.PURCHASED
                 }
-                if (premiumPurchase != null) {
-                    handlePurchase(premiumPurchase)
-                } else {
-                    setPremium(false)
-                }
+                if (owned != null) handlePurchase(owned) else setPremium(false)
             }
+            // On error: keep the current state; don't revoke Premium because of a network blip.
         }
     }
 
@@ -153,18 +210,15 @@ class BillingManager(context: Context) {
         if (!purchase.products.contains(PREMIUM_PRODUCT_ID)) return
         if (purchase.purchaseState != Purchase.PurchaseState.PURCHASED) return
 
+        // Unlock first, acknowledge second.
+        setPremium(true)
+
         if (!purchase.isAcknowledged) {
             billingClient.acknowledgePurchase(
-                com.android.billingclient.api.AcknowledgePurchaseParams.newBuilder()
+                AcknowledgePurchaseParams.newBuilder()
                     .setPurchaseToken(purchase.purchaseToken)
                     .build()
-            ) { result ->
-                if (result.responseCode == BillingClient.BillingResponseCode.OK) {
-                    setPremium(true)
-                }
-            }
-        } else {
-            setPremium(true)
+            ) { /* If this fails, it is retried on the next refreshPurchases(). */ }
         }
     }
 }

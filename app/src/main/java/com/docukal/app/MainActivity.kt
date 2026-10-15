@@ -5,6 +5,7 @@ import android.app.Activity
 import android.app.DatePickerDialog
 import android.content.Intent
 import android.net.Uri
+import android.widget.Toast
 import android.os.Build
 import android.os.Bundle
 import android.provider.OpenableColumns
@@ -36,6 +37,7 @@ import androidx.compose.material.icons.filled.ArrowBack
 import androidx.compose.material.icons.filled.AttachFile
 import androidx.compose.material.icons.filled.CalendarMonth
 import androidx.compose.material.icons.filled.CheckCircle
+import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.CloudDownload
 import androidx.compose.material.icons.filled.CloudUpload
 import androidx.compose.material.icons.filled.DeleteForever
@@ -94,7 +96,10 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import androidx.compose.ui.graphics.Color
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.compose.LifecycleEventEffect
 import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.navigation.NavHostController
 import androidx.navigation.compose.currentBackStackEntryAsState
@@ -116,14 +121,19 @@ import com.docukal.app.utils.daysUntil
 import com.docukal.app.utils.expiryStatus
 import com.docukal.app.utils.formatDate
 import com.docukal.app.utils.startOfDay
-import com.docukal.app.utils.DocumentAutoFill
+import com.docukal.app.ui.BackupControls
+import com.docukal.app.ui.DocTypeBadge
+import com.docukal.app.ui.ShareDocumentButton
+import com.docukal.app.ui.DocumentDetailScreen
+import com.docukal.app.ui.DocumentEditor
+import com.docukal.app.utils.DocKind
 import com.docukal.app.viewmodel.MainViewModel
 import java.util.Calendar
 
 /** Reminder lead times offered throughout the app, matching the product requirement. */
 private val REMINDER_OPTIONS = listOf(1, 3, 7, 15, 30, 60, 90)
 
-private fun showSaveAdIfNeeded(context: android.content.Context, premium: Boolean, onFinished: () -> Unit) {
+fun showSaveAdIfNeeded(context: android.content.Context, premium: Boolean, onFinished: () -> Unit) {
     if (premium) {
         onFinished()
         return
@@ -189,6 +199,7 @@ fun App(
     val billingPremium by billingManager.premium
     val premium = billingPremium
     LaunchedEffect(Unit) { billingManager.startConnection() }
+    LifecycleEventEffect(Lifecycle.Event.ON_RESUME) { billingManager.refreshPurchases() }
     DisposableEffect(billingManager) {
         onDispose { billingManager.endConnection() }
     }
@@ -402,10 +413,36 @@ private fun PremiumInsightsCard(documentCount: Int, warrantyCount: Int, dateCoun
             Text("Premium Insights", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.ExtraBold)
             Text("Your personal overview without any extra setup.", style = MaterialTheme.typography.bodySmall)
             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                AssistChip(onClick = {}, label = { Text("$documentCount docs") })
-                AssistChip(onClick = {}, label = { Text("$warrantyCount warranties") })
-                AssistChip(onClick = {}, label = { Text("$dateCount dates") })
+                InsightChip("$documentCount docs", Modifier.weight(1f))
+                InsightChip("$warrantyCount warranties", Modifier.weight(1f))
+                InsightChip("$dateCount dates", Modifier.weight(1f))
             }
+        }
+    }
+}
+
+// Compact single-line chip so the count and its label never split across two lines.
+@Composable
+private fun InsightChip(label: String, modifier: Modifier = Modifier) {
+    Surface(
+        modifier = modifier.height(32.dp),
+        shape = RoundedCornerShape(8.dp),
+        color = androidx.compose.ui.graphics.Color.Transparent,
+        border = androidx.compose.foundation.BorderStroke(1.dp, MaterialTheme.colorScheme.outline.copy(alpha = 0.6f))
+    ) {
+        androidx.compose.foundation.layout.Box(
+            modifier = Modifier.fillMaxWidth().padding(horizontal = 4.dp),
+            contentAlignment = Alignment.Center
+        ) {
+            Text(
+                text = label,
+                style = MaterialTheme.typography.labelLarge,
+                fontSize = 12.sp,
+                maxLines = 1,
+                softWrap = false,
+                overflow = androidx.compose.ui.text.style.TextOverflow.Clip,
+                textAlign = androidx.compose.ui.text.style.TextAlign.Center
+            )
         }
     }
 }
@@ -510,13 +547,12 @@ fun DocumentCard(d: DocumentEntity, vm: MainViewModel, onOpen: (DocumentEntity) 
         colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainerHigh)
     ) {
         Row(Modifier.padding(14.dp), verticalAlignment = Alignment.CenterVertically) {
-            Surface(shape = RoundedCornerShape(15.dp), color = MaterialTheme.colorScheme.primary.copy(alpha = 0.14f)) {
-                Icon(Icons.Default.Description, null, Modifier.padding(11.dp).size(27.dp), tint = MaterialTheme.colorScheme.primary)
-            }
+            val kind = DocKind.detect(d.name, d.type, d.number)
+            DocTypeBadge(kind)
             Spacer(Modifier.width(11.dp))
             Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(5.dp)) {
                 Text(d.name, fontWeight = FontWeight.ExtraBold)
-                Text(d.category, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                Text(if (kind == DocKind.OTHER) d.category else "${kind.label} \u2022 ${d.category}", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                 StatusPill(d.expiryDate, d.reminderDays)
                 if (d.attachmentUri != null) {
                     Row(verticalAlignment = Alignment.CenterVertically) {
@@ -526,7 +562,11 @@ fun DocumentCard(d: DocumentEntity, vm: MainViewModel, onOpen: (DocumentEntity) 
                     }
                 }
             }
-            IconButton({ vm.toggleFavorite(d) }) { Icon(if (d.favorite) Icons.Default.Star else Icons.Default.StarBorder, "Favorite", tint = if (d.favorite) AccentOrange else MaterialTheme.colorScheme.onSurfaceVariant) }
+            // Favorite and Share are stacked, so the card's width and text alignment stay unchanged.
+            Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                IconButton({ vm.toggleFavorite(d) }, Modifier.size(40.dp)) { Icon(if (d.favorite) Icons.Default.Star else Icons.Default.StarBorder, "Favorite", Modifier.size(22.dp), tint = if (d.favorite) AccentOrange else MaterialTheme.colorScheme.onSurfaceVariant) }
+                ShareDocumentButton(d, Modifier.size(40.dp), iconSize = 22.dp)
+            }
         }
     }
 }
@@ -754,7 +794,7 @@ fun RemindersScreen(vm: MainViewModel, premium: Boolean) {
                             Spacer(Modifier.width(10.dp))
                             Column(Modifier.weight(1f)) {
                                 Text(d.name, fontWeight = FontWeight.Bold)
-                                Text("${formatDate(d.expiryDate)} • ${d.reminderDays} days before", style = MaterialTheme.typography.bodySmall)
+                                Text("${formatDate(d.expiryDate)} • ${if (d.reminderDays <= 0) "no reminder" else "${d.reminderDays} days before"}", style = MaterialTheme.typography.bodySmall)
                             }
                         }
                     }
@@ -769,7 +809,7 @@ fun RemindersScreen(vm: MainViewModel, premium: Boolean) {
                             Spacer(Modifier.width(10.dp))
                             Column(Modifier.weight(1f)) {
                                 Text(d.title, fontWeight = FontWeight.Bold)
-                                Text("${formatDate(d.date)} • ${d.reminderDays} days before", style = MaterialTheme.typography.bodySmall)
+                                Text("${formatDate(d.date)} • ${if (d.reminderDays <= 0) "no reminder" else "${d.reminderDays} days before"}", style = MaterialTheme.typography.bodySmall)
                             }
                             IconButton({ vm.deleteDate(d) }) { Icon(Icons.Default.Delete, "Delete", tint = MaterialTheme.colorScheme.error) }
                         }
@@ -823,17 +863,7 @@ fun ImportantDateDialog(vm: MainViewModel, premium: Boolean, onClose: () -> Unit
 fun SettingsScreen(vm: MainViewModel, billingManager: BillingManager, premium: Boolean) {
     val settings by vm.settings.collectAsState()
     val context = LocalContext.current
-    val docs by vm.documents.collectAsState()
-    val cats by vm.categories.collectAsState()
-    val warranties by vm.warranties.collectAsState()
-    val dates by vm.dates.collectAsState()
-
-    val exportLauncher = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("application/zip")) { uri ->
-        if (uri != null) BackupUtils.export(context, uri, docs, cats, warranties, dates, settings)
-    }
-    val importLauncher = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
-        if (uri != null) BackupUtils.read(context, uri)?.let { vm.importData(it) }
-    }
+    var confirmClear by remember { mutableStateOf(false) }
 
     Column(
         Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(20.dp),
@@ -857,18 +887,31 @@ fun SettingsScreen(vm: MainViewModel, billingManager: BillingManager, premium: B
 
         HorizontalDivider()
         PremiumCard(premium) {
-            (context as? Activity)?.let { billingManager.launchPremiumPurchase(it) }
+            (context as? Activity)?.let { act ->
+                billingManager.launchPremiumPurchase(act) { msg ->
+                    Toast.makeText(context, msg, Toast.LENGTH_SHORT).show()
+                }
+            }
         }
 
 
 
         HorizontalDivider()
         Text("Data & Backup", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
-        Button({ exportLauncher.launch("docukal-backup.zip") }, Modifier.fillMaxWidth(), shape = RoundedCornerShape(16.dp)) { Icon(Icons.Default.CloudUpload, null); Spacer(Modifier.width(8.dp)); Text("Export Backup") }
-        OutlinedButton({ importLauncher.launch(arrayOf("application/zip")) }, Modifier.fillMaxWidth()) { Icon(Icons.Default.CloudDownload, null); Spacer(Modifier.width(8.dp)); Text("Import Backup") }
-        OutlinedButton({ vm.clearAll() }, Modifier.fillMaxWidth()) { Icon(Icons.Default.DeleteForever, null); Spacer(Modifier.width(8.dp)); Text("Clear All Data") }
+        BackupControls(vm)
+        OutlinedButton({ confirmClear = true }, Modifier.fillMaxWidth()) { Icon(Icons.Default.DeleteForever, null); Spacer(Modifier.width(8.dp)); Text("Clear All Data") }
 
-        Text("DocuKal v1.0.0", style = MaterialTheme.typography.bodySmall)
+        Text("DocuKal v1.1.0", style = MaterialTheme.typography.bodySmall)
+    }
+
+    if (confirmClear) {
+        AlertDialog(
+            onDismissRequest = { confirmClear = false },
+            title = { Text("Clear all data?") },
+            text = { Text("This permanently deletes all your documents, warranties and important dates from this device. Export a backup first if you may need them.") },
+            confirmButton = { Button({ confirmClear = false; vm.clearAll() }) { Text("Delete everything") } },
+            dismissButton = { TextButton({ confirmClear = false }) { Text("Cancel") } }
+        )
     }
 
 }
@@ -876,75 +919,6 @@ fun SettingsScreen(vm: MainViewModel, billingManager: BillingManager, premium: B
 // ---------------------------------------------------------------------------
 // Document detail / edit / add
 // ---------------------------------------------------------------------------
-
-@Composable
-fun DocumentDetailScreen(vm: MainViewModel, id: Long, onBack: () -> Unit) {
-    val context = LocalContext.current
-    val docs by vm.documents.collectAsState()
-    val doc = docs.firstOrNull { it.id == id }
-    if (doc == null) {
-        onBack()
-        return
-    }
-    var editing by remember { mutableStateOf(false) }
-    var confirmDelete by remember { mutableStateOf(false) }
-
-    if (editing) {
-        DocumentEditForm(vm, doc) { editing = false }
-    } else {
-        Column(
-            Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(20.dp),
-            verticalArrangement = Arrangement.spacedBy(12.dp)
-        ) {
-            Title(doc.name, doc.category)
-            Card(shape = RoundedCornerShape(18.dp)) { Row(Modifier.fillMaxWidth().padding(14.dp), verticalAlignment = Alignment.CenterVertically) { Icon(Icons.Default.Event, null, Modifier.size(24.dp), tint = MaterialTheme.colorScheme.primary); Spacer(Modifier.width(10.dp)); Text(statusText(doc.expiryDate, doc.reminderDays), fontWeight = FontWeight.Bold) } }
-            DetailRow("Type", doc.type)
-            DetailRow("Number", doc.number)
-            DetailRow("Issue date", formatDate(doc.issueDate))
-            DetailRow("Expiry date", formatDate(doc.expiryDate))
-            DetailRow("Status", statusText(doc.expiryDate, doc.reminderDays))
-            DetailRow("Reminder", "${doc.reminderDays} days before")
-            DetailRow("Notes", doc.notes)
-            if (doc.attachmentUri != null) {
-                Button(
-                    onClick = {
-                        runCatching {
-                            context.startActivity(
-                                Intent(Intent.ACTION_VIEW, Uri.parse(doc.attachmentUri))
-                                    .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-                            )
-                        }
-                    },
-                    modifier = Modifier.fillMaxWidth()
-                ) { Icon(Icons.Default.AttachFile, null); Spacer(Modifier.width(8.dp)); Text("Open Attachment") }
-            }
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                Button({ editing = true }, Modifier.weight(1f)) { Icon(Icons.Default.Edit, null); Spacer(Modifier.width(6.dp)); Text("Edit") }
-                OutlinedButton({ confirmDelete = true }, Modifier.weight(1f)) { Icon(Icons.Default.DeleteForever, null); Spacer(Modifier.width(6.dp)); Text("Delete") }
-                IconButton({ vm.toggleFavorite(doc) }) {
-                    Icon(if (doc.favorite) Icons.Default.Star else Icons.Default.StarBorder, "Favorite")
-                }
-            }
-            TextButton(onBack) { Text("Back") }
-        }
-    }
-
-    if (confirmDelete) {
-        AlertDialog(
-            onDismissRequest = { confirmDelete = false },
-            title = { Text("Delete document?") },
-            text = { Text("Are you sure you want to delete this document?") },
-            confirmButton = {
-                Button({
-                    vm.deleteDocument(doc)
-                    confirmDelete = false
-                    onBack()
-                }) { Text("Delete") }
-            },
-            dismissButton = { TextButton({ confirmDelete = false }) { Text("Cancel") } }
-        )
-    }
-}
 
 @Composable
 fun DetailRow(label: String, value: String) {
@@ -957,66 +931,26 @@ fun DetailRow(label: String, value: String) {
 }
 
 @Composable
-fun DocumentEditForm(vm: MainViewModel, doc: DocumentEntity, onDone: () -> Unit) {
-    var name by remember { mutableStateOf(doc.name) }
-    var type by remember { mutableStateOf(doc.type) }
-    var number by remember { mutableStateOf(doc.number) }
-    var issue by remember { mutableStateOf(doc.issueDate) }
-    var expiry by remember { mutableStateOf(doc.expiryDate) }
-    var reminderDays by remember { mutableStateOf(doc.reminderDays) }
-    var notes by remember { mutableStateOf(doc.notes) }
-    var error by remember { mutableStateOf<String?>(null) }
-
-    Column(
-        Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(20.dp),
-        verticalArrangement = Arrangement.spacedBy(10.dp)
-    ) {
-        Title("Edit Document")
-        OutlinedTextField(name, { name = it }, Modifier.fillMaxWidth(), label = { Text("Document name *") })
-        OutlinedTextField(type, { type = it }, Modifier.fillMaxWidth(), label = { Text("Document type") })
-        OutlinedTextField(number, { number = it }, Modifier.fillMaxWidth(), label = { Text("Document number") })
-        DateField("Issue date", issue) { issue = it }
-        DateField("Expiry date", expiry) { expiry = it }
-        ReminderSelector(reminderDays) { reminderDays = it }
-        OutlinedTextField(notes, { notes = it }, Modifier.fillMaxWidth(), label = { Text("Notes") }, minLines = 3)
-        error?.let { Text(it, color = MaterialTheme.colorScheme.error) }
-        Button(
-            onClick = {
-                if (name.isBlank()) {
-                    error = "Document name is required"
-                } else if (issue != null && expiry != null && expiry!! < issue!!) {
-                    error = "Expiry cannot be before issue date"
-                } else {
-                    vm.saveDocument(
-                        doc.copy(
-                            name = name, type = type, number = number, issueDate = issue,
-                            expiryDate = expiry, reminderDays = reminderDays, notes = notes,
-                            updatedAt = System.currentTimeMillis()
-                        )
-                    ) { onDone() }
-                }
-            },
-            modifier = Modifier.fillMaxWidth()
-        ) { Text("Save changes") }
-        TextButton(onDone, Modifier.fillMaxWidth()) { Text("Cancel") }
-    }
-}
-
-@Composable
-fun DateField(label: String, value: Long?, onValue: (Long) -> Unit) {
+fun DateField(label: String, value: Long?, onClear: (() -> Unit)? = null, onValue: (Long) -> Unit) {
     val context = LocalContext.current
-    OutlinedButton(
-        onClick = {
-            val calendar = Calendar.getInstance()
-            DatePickerDialog(
-                context,
-                { _, year, month, day -> calendar.set(year, month, day); onValue(calendar.timeInMillis) },
-                calendar.get(Calendar.YEAR), calendar.get(Calendar.MONTH), calendar.get(Calendar.DAY_OF_MONTH)
-            ).show()
-        },
-        modifier = Modifier.fillMaxWidth(),
-        shape = RoundedCornerShape(15.dp)
-    ) { Icon(Icons.Default.CalendarMonth, null, tint = MaterialTheme.colorScheme.primary); Spacer(Modifier.width(8.dp)); Text(if (value == null) label else "$label: ${formatDate(value)}", fontWeight = FontWeight.SemiBold) }
+    Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+        OutlinedButton(
+            onClick = {
+                val calendar = Calendar.getInstance()
+                if (value != null) calendar.timeInMillis = value
+                DatePickerDialog(
+                    context,
+                    { _, year, month, day -> calendar.set(year, month, day); onValue(calendar.timeInMillis) },
+                    calendar.get(Calendar.YEAR), calendar.get(Calendar.MONTH), calendar.get(Calendar.DAY_OF_MONTH)
+                ).show()
+            },
+            modifier = Modifier.weight(1f),
+            shape = RoundedCornerShape(15.dp)
+        ) { Icon(Icons.Default.CalendarMonth, null, tint = MaterialTheme.colorScheme.primary); Spacer(Modifier.width(8.dp)); Text(if (value == null) label else "$label: ${formatDate(value)}", fontWeight = FontWeight.SemiBold) }
+        if (value != null && onClear != null) {
+            IconButton(onClick = onClear) { Icon(Icons.Default.Close, "Clear $label") }
+        }
+    }
 }
 
 /** Chip row for the reminder lead times called out in the product requirement. */
@@ -1025,180 +959,10 @@ fun ReminderSelector(value: Int, onValue: (Int) -> Unit) {
     Column {
         Text("Remind me", style = MaterialTheme.typography.labelLarge)
         Row(Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+            FilterChip(value <= 0, { onValue(0) }, { Text("None") })
             REMINDER_OPTIONS.forEach { days ->
                 FilterChip(value == days, { onValue(days) }, { Text("${days}d") })
             }
-        }
-    }
-}
-
-@Composable
-fun DocumentEditor(vm: MainViewModel, premium: Boolean, onDone: () -> Unit) {
-    val categories by vm.categories.collectAsState()
-    var name by remember { mutableStateOf("") }
-    var type by remember { mutableStateOf("") }
-    var category by remember { mutableStateOf(categories.firstOrNull()?.name ?: "Other") }
-    var number by remember { mutableStateOf("") }
-    var issue by remember { mutableStateOf<Long?>(null) }
-    var expiry by remember { mutableStateOf<Long?>(null) }
-    var notes by remember { mutableStateOf("") }
-    var reminderDays by remember { mutableStateOf(30) }
-    var attachment by remember { mutableStateOf<Uri?>(null) }
-    var error by remember { mutableStateOf<String?>(null) }
-    var showCategoryManager by remember { mutableStateOf(false) }
-    var showSavedDialog by remember { mutableStateOf(false) }
-
-    val context = LocalContext.current
-    val picker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
-        if (uri != null) {
-            // Without this, the picked URI's read grant is revoked after the app
-            // process dies (or the device reboots) and "Open Attachment" breaks.
-            context.contentResolver.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION)
-            attachment = uri
-            // Use information already present in the file (name, MIME type, and
-            // readable content when possible) to avoid retyping it in the form.
-            DocumentAutoFill.analyse(context, uri) { details ->
-                details.name?.let { name = it }
-                details.type?.let { type = it }
-                details.number?.let { number = it }
-                details.notes?.let { notes = it }
-                details.category?.let { suggested ->
-                    categories.firstOrNull { it.name.equals(suggested, ignoreCase = true) }
-                        ?.let { category = it.name }
-                }
-            }
-        }
-    }
-
-    Column(
-        Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(20.dp),
-        verticalArrangement = Arrangement.spacedBy(10.dp)
-    ) {
-        Title("Add Document")
-        OutlinedTextField(name, { name = it }, Modifier.fillMaxWidth(), label = { Text("Document name *") })
-        Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-            OutlinedTextField(
-                value = category,
-                onValueChange = {},
-                modifier = Modifier.weight(1f).clickable { showCategoryManager = true },
-                label = { Text("Category") },
-                leadingIcon = { Icon(Icons.Default.Category, null) },
-                readOnly = true
-            )
-            Spacer(Modifier.width(6.dp))
-            IconButton(onClick = { showCategoryManager = true }) { Icon(Icons.Default.Settings, "Manage categories") }
-        }
-        OutlinedTextField(type, { type = it }, Modifier.fillMaxWidth(), label = { Text("Document type") })
-        OutlinedTextField(number, { number = it }, Modifier.fillMaxWidth(), label = { Text("Document number") })
-        DateField("Issue date", issue) { issue = it }
-        DateField("Expiry date", expiry) { expiry = it }
-        ReminderSelector(reminderDays) { reminderDays = it }
-        OutlinedTextField(notes, { notes = it }, Modifier.fillMaxWidth(), label = { Text("Notes") }, minLines = 3)
-        OutlinedButton({ picker.launch(arrayOf("image/*", "application/pdf", "text/*")) }, Modifier.fillMaxWidth()) {
-            Icon(Icons.Default.AttachFile, null); Spacer(Modifier.width(8.dp)); Text(if (attachment == null) "Attach image / PDF" else "Attachment selected")
-        }
-        attachment?.let { AttachedFileCard(it) }
-        error?.let { Text(it, color = MaterialTheme.colorScheme.error) }
-        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-            Button(
-                onClick = {
-                    when {
-                        name.isBlank() -> error = "Document name is required"
-                        issue != null && expiry != null && expiry!! < issue!! -> error = "Expiry cannot be before issue date"
-                        else -> {
-                            vm.saveDocument(
-                                DocumentEntity(
-                                    name = name, type = type, category = category, number = number,
-                                    issueDate = issue, expiryDate = expiry, reminderDays = reminderDays,
-                                    notes = notes, attachmentUri = attachment?.toString()
-                                )
-                            ) {
-                                showSaveAdIfNeeded(context, premium) { showSavedDialog = true }
-                            }
-                        }
-                    }
-                },
-                modifier = Modifier.weight(1f)
-            ) { Text("Save Document") }
-            OutlinedButton(onDone, Modifier.weight(1f)) { Text("Cancel") }
-        }
-    }
-
-    if (showCategoryManager) {
-        AlertDialog(
-            onDismissRequest = { showCategoryManager = false },
-            title = { Text("Manage Categories") },
-            text = {
-                Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                    Text("Choose a category for this document", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                    categories.forEach { item ->
-                        Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-                            Text(
-                                item.name,
-                                Modifier.weight(1f).clickable {
-                                    category = item.name
-                                    showCategoryManager = false
-                                },
-                                fontWeight = FontWeight.SemiBold
-                            )
-                            if (!item.isDefault) {
-                                IconButton(onClick = { vm.deleteCategory(item) }) {
-                                    Icon(Icons.Default.Delete, "Delete category", tint = MaterialTheme.colorScheme.error)
-                                }
-                            }
-                        }
-                    }
-                    var newCategory by remember { mutableStateOf("") }
-                    Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-                        OutlinedTextField(newCategory, { newCategory = it }, Modifier.weight(1f), label = { Text("New category") }, singleLine = true)
-                        Spacer(Modifier.width(6.dp))
-                        IconButton(onClick = { if (newCategory.isNotBlank()) { vm.addCategory(newCategory.trim()); newCategory = "" } }) {
-                            Icon(Icons.Default.Add, "Add category", tint = MaterialTheme.colorScheme.primary)
-                        }
-                    }
-                }
-            },
-            confirmButton = { TextButton({ showCategoryManager = false }) { Text("Done") } }
-        )
-    }
-
-    if (showSavedDialog) {
-        AlertDialog(
-            onDismissRequest = { showSavedDialog = false; onDone() },
-            title = { Text("Document saved") },
-            text = { Text("Your document has been saved successfully.") },
-            confirmButton = { TextButton({ showSavedDialog = false; onDone() }) { Text("OK") } }
-        )
-    }
-}
-
-@Composable
-private fun AttachedFileCard(uri: Uri) {
-    val context = LocalContext.current
-    val filename = remember(uri) {
-        context.contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)
-            ?.use { cursor -> if (cursor.moveToFirst()) cursor.getString(0) else null }
-            ?: uri.lastPathSegment
-            ?: "Attached file"
-    }
-    Card(Modifier.fillMaxWidth()) {
-        Row(
-            Modifier.fillMaxWidth().padding(12.dp),
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(10.dp)
-        ) {
-            Icon(Icons.Default.Description, contentDescription = null)
-            Column(Modifier.weight(1f)) {
-                Text("Attached file", style = MaterialTheme.typography.labelMedium)
-                Text(filename, style = MaterialTheme.typography.bodyMedium)
-            }
-            TextButton(onClick = {
-                val mimeType = context.contentResolver.getType(uri) ?: "*/*"
-                context.startActivity(Intent(Intent.ACTION_VIEW, uri).apply {
-                    setDataAndType(uri, mimeType)
-                    addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-                })
-            }) { Text("View") }
         }
     }
 }

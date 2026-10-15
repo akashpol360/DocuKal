@@ -10,6 +10,9 @@ import com.docukal.app.data.local.WarrantyEntity
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.BufferedOutputStream
+import java.io.File
+import java.io.IOException
+import java.util.UUID
 import java.util.zip.ZipEntry
 import java.util.zip.ZipInputStream
 import java.util.zip.ZipOutputStream
@@ -19,15 +22,37 @@ data class BackupData(
     val categories: List<CategoryEntity>,
     val warranties: List<WarrantyEntity>,
     val dates: List<ImportantDateEntity>,
-    val settings: SettingsEntity?
+    val settings: SettingsEntity?,
+    /** Attached files that were found in the backup and copied into the app. */
+    val attachmentsRestored: Int = 0,
+    /** Documents that had an attachment but whose file is not part of the backup (older backups). */
+    val attachmentsNotIncluded: Int = 0,
+    /** URIs (file://) of the attachment copies made while reading the backup. */
+    val restoredUris: Set<String> = emptySet(),
+    /** Items left out because they already exist (see [BackupUtils.dropDuplicates]). */
+    val duplicatesSkipped: Int = 0
+)
+
+data class ExportSummary(
+    val documents: Int,
+    val warranties: Int,
+    val dates: Int,
+    val attachmentsIncluded: Int,
+    val attachmentsMissing: Int
 )
 
 /**
- * Local-only backup/restore: writes a single-entry ZIP (data.json) via Android's
+ * Local-only backup/restore: writes a ZIP (data.json plus the attached files) via Android's
  * Storage Access Framework. Nothing here ever touches the network.
  */
 object BackupUtils {
 
+    /**
+     * Writes the backup ZIP. Besides data.json it now also stores every attached file
+     * under files/, so documents keep their image / PDF after a restore (a saved URI
+     * alone stops working once the app is reinstalled or its data is cleared).
+     * Does file I/O: call from a background thread. Throws on failure.
+     */
     fun export(
         context: Context,
         uri: Uri,
@@ -36,44 +61,166 @@ object BackupUtils {
         warranties: List<WarrantyEntity>,
         dates: List<ImportantDateEntity>,
         settings: SettingsEntity?
-    ) {
-        val outputStream = context.contentResolver.openOutputStream(uri) ?: return
+    ): ExportSummary {
+        val resolver = context.contentResolver
+        val outputStream = resolver.openOutputStream(uri)
+            ?: throw IOException("Could not open the selected location for writing.")
+        var included = 0
+        var missing = 0
+
         ZipOutputStream(BufferedOutputStream(outputStream)).use { zip ->
+            val docsJson = JSONArray()
+            docs.forEachIndexed { index, doc ->
+                val json = doc.toJson()
+                val attachment = doc.attachmentUri
+                if (attachment != null) {
+                    val source = Uri.parse(attachment)
+                    // Only "cannot open" counts as a missing file; real I/O errors abort the export.
+                    val stream = try {
+                        resolver.openInputStream(source)
+                    } catch (e: Exception) {
+                        null
+                    }
+                    if (stream == null) {
+                        missing++
+                    } else {
+                        val originalName = AttachmentUtils.displayName(context, source)
+                            ?: source.lastPathSegment
+                            ?: "attachment"
+                        val entryName = "files/${index}_${safeName(originalName)}"
+                        stream.use { input ->
+                            zip.putNextEntry(ZipEntry(entryName))
+                            input.copyTo(zip)
+                            zip.closeEntry()
+                        }
+                        json.put("attachmentFile", entryName).put("attachmentName", originalName)
+                        included++
+                    }
+                }
+                docsJson.put(json)
+            }
+
             val root = JSONObject()
-                .put("version", 2)
-                .put("documents", JSONArray(docs.map { it.toJson() }))
+                .put("version", 3)
+                .put("documents", docsJson)
                 .put("categories", JSONArray(cats.map { it.toJson() }))
                 .put("warranties", JSONArray(warranties.map { it.toJson() }))
                 .put("dates", JSONArray(dates.map { it.toJson() }))
             settings?.let { root.put("settings", it.toJson()) }
 
             zip.putNextEntry(ZipEntry("data.json"))
-            zip.write(root.toString().toByteArray())
+            zip.write(root.toString().toByteArray(Charsets.UTF_8))
             zip.closeEntry()
         }
+        return ExportSummary(docs.size, warranties.size, dates.size, included, missing)
     }
 
-    fun read(context: Context, uri: Uri): BackupData? = try {
-        val inputStream = context.contentResolver.openInputStream(uri) ?: return null
-        ZipInputStream(inputStream).use { zip ->
-            var entry = zip.nextEntry
+    /**
+     * Reads a backup. Attached files found inside it are copied into the app's private
+     * storage and the restored documents point at those copies, so previews work right
+     * after an import. Backups made by older versions (no files/ entries) still import.
+     * Does file I/O: call from a background thread. Returns null if the file is not a
+     * valid backup.
+     */
+    fun read(context: Context, uri: Uri): BackupData? {
+        val restoredFiles = mutableMapOf<String, String>() // zip entry name -> file:// URI
+        val createdFiles = mutableListOf<File>()
+        return try {
+            val inputStream = context.contentResolver.openInputStream(uri) ?: return null
             var text: String? = null
-            while (entry != null) {
-                if (entry.name == "data.json") text = zip.readBytes().toString(Charsets.UTF_8)
-                entry = zip.nextEntry
+            ZipInputStream(inputStream).use { zip ->
+                var entry = zip.nextEntry
+                while (entry != null) {
+                    val name = entry.name
+                    if (name == "data.json") {
+                        text = zip.readBytes().toString(Charsets.UTF_8)
+                    } else if (name.startsWith("files/") && !entry.isDirectory) {
+                        val file = newAttachmentFile(context, name.substringAfterLast('/'))
+                        createdFiles += file
+                        file.outputStream().use { out -> zip.copyTo(out) }
+                        restoredFiles[name] = Uri.fromFile(file).toString()
+                    }
+                    entry = zip.nextEntry
+                }
             }
-            val root = JSONObject(text ?: return null)
+            val root = JSONObject(text ?: throw IOException("data.json missing"))
 
-            val docs = root.optJSONArray("documents")?.toObjectList { it.toDocument() } ?: emptyList()
+            val docs = root.optJSONArray("documents")?.toObjectList { it.toDocument(restoredFiles) } ?: emptyList()
             val cats = root.optJSONArray("categories")?.toObjectList { it.toCategory() } ?: emptyList()
             val warranties = root.optJSONArray("warranties")?.toObjectList { it.toWarranty() } ?: emptyList()
             val dates = root.optJSONArray("dates")?.toObjectList { it.toImportantDate() } ?: emptyList()
             val settings = root.optJSONObject("settings")?.toSettings()
 
-            BackupData(docs, cats, warranties, dates, settings)
+            val restored = docs.count { d -> d.attachmentUri != null && restoredFiles.containsValue(d.attachmentUri) }
+            val notIncluded = docs.count { it.attachmentUri != null } - restored
+            BackupData(docs, cats, warranties, dates, settings, restored, notIncluded, restoredFiles.values.toSet())
+        } catch (_: Exception) {
+            // Invalid backup: remove any files copied so far so nothing is left behind.
+            createdFiles.forEach { runCatching { it.parentFile?.deleteRecursively() } }
+            null
         }
-    } catch (_: Exception) {
-        null
+    }
+
+    /**
+     * Removes everything that already exists in the app (or appears twice inside the
+     * backup) so imports keep every document, warranty and date unique. Attachment
+     * copies belonging to skipped documents are deleted again. Does file I/O: call from
+     * a background thread.
+     */
+    fun dropDuplicates(
+        context: Context,
+        data: BackupData,
+        existingDocs: List<DocumentEntity>,
+        existingWarranties: List<WarrantyEntity>,
+        existingDates: List<ImportantDateEntity>
+    ): BackupData {
+        val cache = mutableMapOf<String, String?>()
+        val acceptedDocs = mutableListOf<DocumentEntity>()
+        var skipped = 0
+        for (doc in data.documents) {
+            val duplicate = DuplicateChecker.findDocumentDuplicate(context, doc, existingDocs + acceptedDocs, null, cache)
+            if (duplicate != null) {
+                skipped++
+                if (doc.attachmentUri in data.restoredUris) deleteRestoredCopy(doc.attachmentUri)
+            } else {
+                acceptedDocs += doc
+            }
+        }
+
+        val seenWarranties = existingWarranties.map { DuplicateChecker.warrantyKey(it) }.toMutableSet()
+        val warranties = data.warranties.filter { seenWarranties.add(DuplicateChecker.warrantyKey(it)) }
+        skipped += data.warranties.size - warranties.size
+
+        val seenDates = existingDates.map { DuplicateChecker.dateKey(it) }.toMutableSet()
+        val dates = data.dates.filter { seenDates.add(DuplicateChecker.dateKey(it)) }
+        skipped += data.dates.size - dates.size
+
+        val restored = acceptedDocs.count { it.attachmentUri in data.restoredUris }
+        val notIncluded = acceptedDocs.count { it.attachmentUri != null } - restored
+        return data.copy(
+            documents = acceptedDocs,
+            warranties = warranties,
+            dates = dates,
+            attachmentsRestored = restored,
+            attachmentsNotIncluded = notIncluded,
+            duplicatesSkipped = skipped
+        )
+    }
+
+    private fun deleteRestoredCopy(uriText: String?) {
+        val path = uriText?.let { Uri.parse(it).path } ?: return
+        runCatching { File(path).parentFile?.deleteRecursively() }
+    }
+
+    private fun safeName(name: String): String =
+        name.replace(Regex("[^A-Za-z0-9._-]"), "_").trimStart('.').take(100)
+
+    /** A new, private file for a restored attachment (the original file name is kept). */
+    private fun newAttachmentFile(context: Context, entryFileName: String): File {
+        val original = entryFileName.substringAfter('_', entryFileName)
+        val dir = File(context.filesDir, "attachments/${UUID.randomUUID()}")
+        dir.mkdirs()
+        return File(dir, safeName(original).ifBlank { "attachment" })
     }
 
     fun validate(context: Context, uri: Uri): Boolean = try {
@@ -121,7 +268,7 @@ object BackupUtils {
         .put("theme", theme).put("defaultReminder", defaultReminder)
         .put("notifications", notifications).put("appLock", appLock)
 
-    private fun JSONObject.toDocument() = DocumentEntity(
+    private fun JSONObject.toDocument(restoredFiles: Map<String, String>) = DocumentEntity(
         name = optString("name"),
         type = optString("type"),
         category = optString("category", "Other"),
@@ -131,7 +278,8 @@ object BackupUtils {
         expiryDate = optLong("expiryDate").takeIf { !isNull("expiryDate") },
         reminderDays = optInt("reminderDays", 30),
         notes = optString("notes"),
-        attachmentUri = optString("attachmentUri").takeIf { it.isNotBlank() },
+        attachmentUri = restoredFiles[optString("attachmentFile")]
+            ?: optString("attachmentUri").takeIf { it.isNotBlank() },
         favorite = optBoolean("favorite")
     )
 

@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<paths>
+    <!-- Attachments restored from a backup are kept here. -->
+    <files-path name="attachments" path="attachments/" />
+    <!-- Temporary copies created when sharing a document. -->
+    <cache-path name="shared" path="shared/" />
+</paths>

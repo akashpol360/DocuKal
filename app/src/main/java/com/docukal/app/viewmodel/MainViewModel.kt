@@ -97,7 +97,15 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
 
     fun saveSettings(s: SettingsEntity) = viewModelScope.launch { repo.saveSettings(s) }
 
-    fun importData(x: BackupData) = viewModelScope.launch { repo.importData(x) }
+    fun importData(x: BackupData, onDone: (Boolean) -> Unit = {}) = viewModelScope.launch {
+        val ok = try {
+            repo.importData(x)
+            true
+        } catch (e: Exception) {
+            false
+        }
+        onDone(ok)
+    }
 
     fun clearAll() = viewModelScope.launch { repo.clearAll() }
 }
